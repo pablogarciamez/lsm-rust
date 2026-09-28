@@ -35,10 +35,13 @@ fn list_sstables(directory: &Path) -> Result<Vec<(u64, PathBuf)>> {
 }
 
 impl Store {
-    pub fn new(&self, wal_filename: &Path, directory: Option<&Path>, max_length: Option<usize>) -> Result<Store> {
-        let directory: &Path = match directory {
+    pub fn new(wal_filename: &Path, directory: Option<&Path>, max_length: Option<usize>) -> Result<Store> {
+        let directory = match directory {
             Some(d) => d,
-            None => wal_filename.parent().unwrap_or(Path::new(".")),
+            None => wal_filename
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
         };
 
         let max_length: usize = match max_length {
@@ -67,16 +70,16 @@ impl Store {
 
         Ok(Store{
             wal_filename: wal_filename.to_path_buf(),
-            memtable: Memtable::new(),
+            memtable,
             directory: directory.to_path_buf(),
-            sstables: sstables,
-            counter: counter,
+            sstables,
+            counter,
             max_length: max_length,
         })
     }
 
     pub fn put(&mut self, key: &str, val: &str) -> Result<()> {
-        write_entry(0, key, val, &self.wal_filename.to_path_buf())?;
+        write_entry(0, key, val, &self.wal_filename)?;
         self.memtable.put(key, val);
         if self.memtable.data.len() >= self.max_length {
             self.flush()?;
@@ -113,7 +116,7 @@ impl Store {
 
     pub fn flush(&mut self) -> Result<()> {
         let sst_filename: PathBuf = self.directory.join(format!("{}.sst", self.counter));
-        write_sstable(&self.memtable, &sst_filename.as_path())?;
+        write_sstable(&self.memtable, &sst_filename)?;
         self.counter += 1;
         self.sstables.push(sst_filename);
         self.memtable = Memtable::new();
@@ -125,7 +128,7 @@ impl Store {
         let sst_filename: PathBuf = self.directory.join(format!("{}.sst", self.counter));
         let found: Vec<(u64, PathBuf)> = list_sstables(&self.directory)?;
         let sstable_paths: Vec<&Path> = found.iter().map(|(_, p)| p.as_path()).collect();
-        write_sstable(&merge_sstables(&sstable_paths)?, &sst_filename.clone())?;
+        write_sstable(&merge_sstables(&sstable_paths)?, &sst_filename)?;
         self.counter += 1;
         self.sstables.push(sst_filename.clone());
         for path in &self.sstables[..self.sstables.len() - 1] {

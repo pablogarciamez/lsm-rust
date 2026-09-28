@@ -1,11 +1,11 @@
 use std::fs::File;
-use std::path::{Path};
+use std::path::{Path, PathBuf};
 use std::io::{Read, Seek, SeekFrom, Write, Error, ErrorKind, Result};
 use crate::memtable::{Memtable, Value};
 use crate::wal::read_entry;
 
 pub fn write_sstable(memtable: &Memtable, path: &Path) -> Result<()>{
-    let temp_path = path.parent().unwrap().join("temp.sst");
+    let temp_path: PathBuf = path.with_extension("tmp");
     let mut index: Vec<(&str, u64)> = Vec::new();
     let mut f = File::create(&temp_path)?;
     for (key, val) in memtable.data.iter() {
