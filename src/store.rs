@@ -138,3 +138,206 @@ impl Store {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir: PathBuf = std::env::temp_dir().join(format!("lsm_rust_{}", name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn put_get_delete_roundtrip() -> Result<()> {
+        let dir: PathBuf = temp_dir("store_put_get_delete_roundtrip");
+        let wal: PathBuf = dir.join("wal.log");
+        let mut store: Store = Store::new(wal.as_path(), Some(dir.as_path()), Some(100))?;
+        store.put("a", "1")?;
+        store.put("b", "2")?;
+        assert_eq!(store.get("a")?, Some("1".to_string()));
+        assert_eq!(store.get("b")?, Some("2".to_string()));
+        assert_eq!(store.get("z")?, None);
+        store.put("b", "22")?;
+        assert_eq!(store.get("b")?, Some("22".to_string()));
+        store.delete("a")?;
+        assert_eq!(store.get("a")?, None);
+        assert_eq!(store.get("b")?, Some("22".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn auto_flush_and_newer_sstable_shadows() -> Result<()> {
+        let dir: PathBuf = temp_dir("store_auto_flush_and_newer_sstable_shadows");
+        let wal: PathBuf = dir.join("wal.log");
+        let mut store: Store = Store::new(wal.as_path(), Some(dir.as_path()), Some(2))?;
+
+        // Primer flush: 0.sst con a=1, b=2
+        store.put("a", "1")?;
+        assert!(!dir.join("0.sst").exists());
+        store.put("b", "2")?;
+        assert!(dir.join("0.sst").exists());
+        assert_eq!(std::fs::metadata(&wal)?.len(), 0);
+
+        // Segundo flush: 1.sst con a=11, c=3 (a sobrescribe la de 0.sst)
+        store.put("a", "11")?;
+        store.put("c", "3")?;
+        assert!(dir.join("1.sst").exists());
+        assert_eq!(store.get("a")?, Some("11".to_string()));
+        assert_eq!(store.get("b")?, Some("2".to_string()));
+        assert_eq!(store.get("c")?, Some("3".to_string()));
+
+        // Tercer flush: 2.sst con b borrado, d=4
+        store.delete("b")?;
+        store.put("d", "4")?;
+        assert!(dir.join("2.sst").exists());
+        assert_eq!(store.get("b")?, None);
+        assert_eq!(store.get("a")?, Some("11".to_string()));
+        assert_eq!(store.get("d")?, Some("4".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn reopen_recovers_from_wal() -> Result<()> {
+        let dir: PathBuf = temp_dir("store_reopen_recovers_from_wal");
+        let wal: PathBuf = dir.join("wal.log");
+
+        let mut store: Store = Store::new(wal.as_path(), Some(dir.as_path()), Some(100))?;
+        store.put("a", "1")?;
+        store.put("b", "2")?;
+        store.put("b", "22")?;
+        store.delete("a")?;
+        assert!(std::fs::metadata(&wal)?.len() > 0);
+        drop(store);
+
+        let mut store: Store = Store::new(wal.as_path(), Some(dir.as_path()), Some(100))?;
+        assert_eq!(store.get("a")?, None);
+        assert_eq!(store.get("b")?, Some("22".to_string()));
+        assert_eq!(store.get("z")?, None);
+
+        // Escribir tras recuperar y reabrir otra vez
+        store.put("c", "3")?;
+        drop(store);
+        let store: Store = Store::new(wal.as_path(), Some(dir.as_path()), Some(100))?;
+        assert_eq!(store.get("a")?, None);
+        assert_eq!(store.get("b")?, Some("22".to_string()));
+        assert_eq!(store.get("c")?, Some("3".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn reopen_recovers_from_sstables() -> Result<()> {
+        let dir: PathBuf = temp_dir("store_reopen_recovers_from_sstables");
+        let wal: PathBuf = dir.join("wal.log");
+
+        let mut store: Store = Store::new(wal.as_path(), Some(dir.as_path()), Some(2))?;
+        store.put("a", "1")?;
+        store.put("b", "2")?;      // flush -> 0.sst (a=1, b=2)
+        store.delete("b")?;
+        store.put("c", "3")?;      // flush -> 1.sst (b borrado, c=3)
+        store.put("d", "4")?;      // se queda en memtable y WAL
+        assert!(dir.join("0.sst").exists());
+        assert!(dir.join("1.sst").exists());
+        assert!(!dir.join("2.sst").exists());
+        drop(store);
+
+        let mut store: Store = Store::new(wal.as_path(), Some(dir.as_path()), Some(2))?;
+        assert_eq!(store.counter, 2);
+        assert_eq!(store.sstables.len(), 2);
+        assert_eq!(store.get("a")?, Some("1".to_string()));
+        assert_eq!(store.get("b")?, None);
+        assert_eq!(store.get("c")?, Some("3".to_string()));
+        assert_eq!(store.get("d")?, Some("4".to_string()));
+
+        // Un flush tras reabrir debe crear 2.sst sin pisar los anteriores
+        store.put("e", "5")?;      // memtable llega a 2 -> flush -> 2.sst (d=4, e=5)
+        assert!(dir.join("2.sst").exists());
+        assert_eq!(store.get("a")?, Some("1".to_string()));
+        assert_eq!(store.get("b")?, None);
+        assert_eq!(store.get("c")?, Some("3".to_string()));
+        assert_eq!(store.get("d")?, Some("4".to_string()));
+        assert_eq!(store.get("e")?, Some("5".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn compact_keeps_latest_and_removes_old() -> Result<()> {
+        use crate::sstable::read_sstable;
+        let dir: PathBuf = temp_dir("store_compact_keeps_latest_and_removes_old");
+        let wal: PathBuf = dir.join("wal.log");
+        let mut store: Store = Store::new(wal.as_path(), Some(dir.as_path()), Some(2))?;
+
+        store.put("a", "1")?;
+        store.put("b", "2")?;      // flush -> 0.sst (a=1, b=2)
+        store.put("a", "11")?;
+        store.put("c", "3")?;      // flush -> 1.sst (a=11, c=3)
+        store.delete("b")?;
+        store.put("d", "4")?;      // flush -> 2.sst (b borrado, d=4)
+        store.put("e", "5")?;      // se queda en memtable y WAL
+        assert_eq!(store.sstables.len(), 3);
+        assert_eq!(store.counter, 3);
+
+        store.compact()?;
+
+        let sst_files: Vec<String> = read_dir(&dir)?
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".sst"))
+            .collect();
+        assert_eq!(sst_files, vec!["3.sst".to_string()]);
+        assert_eq!(store.sstables.len(), 1);
+        assert_eq!(store.counter, 4);
+
+        let expected: Vec<(String, Value)> = vec![
+            ("a".to_string(), Value::Present("11".to_string())),
+            ("c".to_string(), Value::Present("3".to_string())),
+            ("d".to_string(), Value::Present("4".to_string())),
+        ];
+        assert_eq!(read_sstable(dir.join("3.sst").as_path())?, expected);
+
+        assert_eq!(store.get("a")?, Some("11".to_string()));
+        assert_eq!(store.get("b")?, None);
+        assert_eq!(store.get("c")?, Some("3".to_string()));
+        assert_eq!(store.get("d")?, Some("4".to_string()));
+        assert_eq!(store.get("e")?, Some("5".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn compact_then_reopen() -> Result<()> {
+        let dir: PathBuf = temp_dir("store_compact_then_reopen");
+        let wal: PathBuf = dir.join("wal.log");
+        let mut store: Store = Store::new(wal.as_path(), Some(dir.as_path()), Some(2))?;
+
+        store.put("a", "1")?;
+        store.put("b", "2")?;      // flush -> 0.sst (a=1, b=2)
+        store.put("a", "11")?;
+        store.put("c", "3")?;      // flush -> 1.sst (a=11, c=3)
+        store.delete("b")?;
+        store.put("d", "4")?;      // flush -> 2.sst (b borrado, d=4)
+        store.put("e", "5")?;      // se queda en memtable y WAL
+        store.compact()?;          // -> 3.sst, borra 0, 1 y 2
+        drop(store);
+
+        let mut store: Store = Store::new(wal.as_path(), Some(dir.as_path()), Some(2))?;
+        assert_eq!(store.counter, 4);
+        assert_eq!(store.sstables.len(), 1);
+        assert_eq!(store.get("a")?, Some("11".to_string()));
+        assert_eq!(store.get("b")?, None);
+        assert_eq!(store.get("c")?, Some("3".to_string()));
+        assert_eq!(store.get("d")?, Some("4".to_string()));
+        assert_eq!(store.get("e")?, Some("5".to_string()));
+
+        // Flush tras reabrir: memtable {e} + f llega a 2 -> 4.sst
+        store.put("f", "6")?;
+        assert!(dir.join("3.sst").exists());
+        assert!(dir.join("4.sst").exists());
+        assert!(!dir.join("0.sst").exists());
+        assert_eq!(store.get("a")?, Some("11".to_string()));
+        assert_eq!(store.get("b")?, None);
+        assert_eq!(store.get("e")?, Some("5".to_string()));
+        assert_eq!(store.get("f")?, Some("6".to_string()));
+        Ok(())
+    }
+}
